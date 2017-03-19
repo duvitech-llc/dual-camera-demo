@@ -102,6 +102,8 @@ struct v4l2_device_info {
 	struct dmabuf_buffer **buffers;
 } cap0_device, cap1_device;
 
+static volatile int dc_waiting_for_flip;
+
 static struct omap_bo *alloc_bo(struct drm_device_info *device, unsigned int bpp,
 		unsigned int width, unsigned int height,
 		unsigned int *bo_handle, unsigned int *pitch)
@@ -704,16 +706,23 @@ static void drm_restore_props(struct drm_device_info *device)
 */
 static int drm_init_device(struct drm_device_info *device)
 {
-	if (!device->fd) {
+	if ((!status.drm_fd) && (!device->fd)) {
 		device->fd = drmOpen("omapdrm", NULL);
 		if (device->fd < 0) {
 			ERROR("could not open drm device: %s (%d)", strerror(errno), errno);
 			return -1;
 		}
 	}
+    else
+    {
+        device->fd = status.drm_fd;
+	}
 
-	drmSetClientCap(device->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
-	drmSetClientCap(device->fd, DRM_CLIENT_CAP_ATOMIC, 1);
+    if (!status.drm_fd)
+    {
+	    drmSetClientCap(device->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+	    drmSetClientCap(device->fd, DRM_CLIENT_CAP_ATOMIC, 1);
+    }
 
 	device->dev = omap_device_new(device->fd);
 
@@ -735,15 +744,17 @@ static int drm_init_device(struct drm_device_info *device)
 static void drm_exit_device(struct drm_device_info *device)
 {
 	drm_restore_props(device);
-	drmSetClientCap(device->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 0);
-	drmSetClientCap(device->fd, DRM_CLIENT_CAP_ATOMIC, 0);
+    if (!status.drm_fd)
+    {
+	    drmSetClientCap(device->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 0);
+	    drmSetClientCap(device->fd, DRM_CLIENT_CAP_ATOMIC, 0);
+    }
 
 	omap_device_del(device->dev);
 	device->dev = NULL;
-	if (device->fd > 0) {
+	if ((!status.drm_fd) && (device->fd > 0)) {
 		close(device->fd);
 	}
-
 	return;
 }
 
@@ -969,8 +980,6 @@ void set_plane_properties()
 	int ret;
 	drmModeAtomicReqPtr req = drmModeAtomicAlloc();
 
-	req = drmModeAtomicAlloc();
-
 	drmModeAtomicAddProperty(req, drm_device.plane_id[0],
 		drm_device.prop_fbid, drm_device.buf[status.main_cam][0]->fb_id);
 
@@ -1110,83 +1119,144 @@ static void page_flip_handler(int fd, unsigned int frame,
 	*waiting_for_flip = 0;
 }
 
+static void page_flip_handler_null(int fd, unsigned int frame,
+							       unsigned int sec, unsigned int usec,
+							       void *data)
+{
+
+}
+
 /*
 * Determines which camera feeds are being displayed and
 * whether a jpeg image needs to be captured.
 */
 void process_frame(void)
 {
-	fd_set fds;
-	int ret, waiting_for_flip = 1;
+	int ret;
 	struct dmabuf_buffer *buf[2] = {NULL, NULL};
-	drmModeAtomicReqPtr req = drmModeAtomicAlloc();
-
 	struct v4l2_device_info *v4l2_device[2] =
 	{&cap0_device, &cap1_device};
 
-	drmEventContext evctx = {
-		.version = DRM_EVENT_CONTEXT_VERSION,
-		.vblank_handler = 0,
-		.page_flip_handler = page_flip_handler,
-	};
+    if (!status.drm_fd)
+    {
+        fd_set fds;
+	    drmModeAtomicReqPtr req = drmModeAtomicAlloc();
 
-	/* Request a capture buffer from the driver that can be copied to */
-	/* framebuffer */
-	buf[status.main_cam] =
-		v4l2_dequeue_buffer(v4l2_device[status.main_cam]);
-	drmModeAtomicAddProperty(req, drm_device.plane_id[0],
-		drm_device.prop_fbid, buf[status.main_cam]->fb_id);
+	    drmEventContext evctx = {
+		    .version = DRM_EVENT_CONTEXT_VERSION,
+		    .vblank_handler = 0,
+		    .page_flip_handler = page_flip_handler,
+	    };
 
-	if (status.pip==true) {
-		buf[!status.main_cam] =
-			v4l2_dequeue_buffer(v4l2_device[!status.main_cam]);
-		drmModeAtomicAddProperty(req, drm_device.plane_id[1],
-			drm_device.prop_fbid, buf[!status.main_cam]->fb_id);
-	}
+	    /* Request a capture buffer from the driver that can be copied to */
+	    /* framebuffer */
+	    buf[status.main_cam] =
+		    v4l2_dequeue_buffer(v4l2_device[status.main_cam]);
+	    drmModeAtomicAddProperty(req, drm_device.plane_id[0],
+		    drm_device.prop_fbid, buf[status.main_cam]->fb_id);
 
-	ret = drmModeAtomicCommit(drm_device.fd, req,
-		DRM_MODE_ATOMIC_TEST_ONLY, 0);
+	    if (status.pip==true) {
+		    buf[!status.main_cam] =
+			    v4l2_dequeue_buffer(v4l2_device[!status.main_cam]);
+		    drmModeAtomicAddProperty(req, drm_device.plane_id[1],
+			    drm_device.prop_fbid, buf[!status.main_cam]->fb_id);
+	    }
 
-	if(!ret){
-		drmModeAtomicCommit(drm_device.fd, req,
-			DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK, &waiting_for_flip);
-		}
-		else {
-		ERROR("failed to add plane atomically: %s", strerror(errno));
-		}
+	    ret = drmModeAtomicCommit(drm_device.fd, req,
+		    DRM_MODE_ATOMIC_TEST_ONLY, 0);
 
-	drmModeAtomicFree(req);
+	    if(!ret){
+            dc_waiting_for_flip = 1;
+		    drmModeAtomicCommit(drm_device.fd, req,
+			    DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK, &dc_waiting_for_flip);
+		    }
 
-	/* Save jpeg image if triggered */
-	if (status.jpeg==true) {
-		capture_frame(v4l2_device[status.main_cam], buf[status.main_cam]);
-		status.jpeg=false;
-		status.num_jpeg++;
-		if (status.num_jpeg==10)
-			status.num_jpeg=0;
-	}
+		    else {
+		    ERROR("failed to add plane atomically: %s", strerror(errno));
+		    }
 
-	FD_ZERO(&fds);
-	FD_SET(drm_device.fd, &fds);
+	    drmModeAtomicFree(req);
 
-	while (waiting_for_flip) {
-		ret = select(drm_device.fd + 1, &fds, NULL, NULL, NULL);
-		if (ret < 0) {
-			printf("select err: %s\n", strerror(errno));
-			return;
-		}
-		else if (ret == 0) {
-			printf("select timeout!\n");
-			return;
-		}
-		else if (FD_ISSET(0, &fds)) {
-			continue;
-		}
-		drmHandleEvent(drm_device.fd, &evctx);
-	}
+	    /* Save jpeg image if triggered */
+	    if (status.jpeg==true) {
+		    capture_frame(v4l2_device[status.main_cam], buf[status.main_cam]);
+		    status.jpeg=false;
+		    status.num_jpeg++;
+		    if (status.num_jpeg==10)
+			    status.num_jpeg=0;
+	    }
+
+	    FD_ZERO(&fds);
+	    FD_SET(drm_device.fd, &fds);
+
+	    while (dc_waiting_for_flip) {
+		    ret = select(drm_device.fd + 1, &fds, NULL, NULL, NULL);
+		    if (ret < 0) {
+			    printf("select err: %s\n", strerror(errno));
+			    return;
+		    }
+		    else if (ret == 0) {
+			    printf("select timeout!\n");
+			    return;
+		    }
+		    else if (FD_ISSET(0, &fds)) {
+			    continue;
+		    }
+		    drmHandleEvent(drm_device.fd, &evctx);
+	    }
+
+    }
+    else
+    {
+
+	    struct v4l2_device_info *v4l2_device[2] =
+	    {&cap0_device, &cap1_device};
+
+	    /* Request a capture buffer from the driver that can be copied to */
+	    /* framebuffer */
+	    buf[status.main_cam] =
+		    v4l2_dequeue_buffer(v4l2_device[status.main_cam]);
+
+        dc_waiting_for_flip = 1;
+
+        status.drm_plane_set_req_handler(drm_device.plane_id[0],
+                                         drm_device.prop_fbid,
+                                         buf[status.main_cam]->fb_id,
+                                         (status.pip==true)?page_flip_handler_null:
+                                                            page_flip_handler,
+                                         (void *)&dc_waiting_for_flip);
+                                         
+    	//MSG("process_frame: send event!");
+                                         
+
+	    if (status.pip==true) {
+		    buf[!status.main_cam] =
+			    v4l2_dequeue_buffer(v4l2_device[!status.main_cam]);
+
+            status.drm_plane_set_req_handler(drm_device.plane_id[1],
+                                             drm_device.prop_fbid,
+                                             buf[!status.main_cam]->fb_id,
+                                             page_flip_handler,
+                                             (void *)&dc_waiting_for_flip);
+	    }
+
+	    /* Save jpeg image if triggered */
+	    if (status.jpeg==true) {
+		    capture_frame(v4l2_device[status.main_cam], buf[status.main_cam]);
+		    status.jpeg=false;
+		    status.num_jpeg++;
+		    if (status.num_jpeg==10)
+			    status.num_jpeg=0;
+	    }
+
+	    while (dc_waiting_for_flip) {
+            usleep(1000);
+	    }
+    }
 
 	v4l2_queue_buffer(v4l2_device[status.main_cam], buf[status.main_cam]);
 	if(status.pip == true){
 		v4l2_queue_buffer(v4l2_device[!status.main_cam], buf[!status.main_cam]);
 	}
+
 }

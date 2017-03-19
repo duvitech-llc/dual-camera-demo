@@ -1,9 +1,11 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 #include <QThread>
+#include <QElapsedTimer>
 #include <QMutex>
 #include "loopback.h"
 #include <stdio.h>
+#include <qpa/qplatformnativeinterface.h>
 
 class MyThread : public QThread
 {
@@ -16,13 +18,17 @@ protected:
 MyThread* loopback;
 QMutex drm_resource;
 
-MainWindow::MainWindow(QWidget *parent) :
+MainWindow::MainWindow(QWidget *parent, QApplication* a) :
 QMainWindow(parent),
 ui(new Ui::MainWindow)
 {
 	ui->setupUi(this);
 	this->setAttribute(Qt::WA_TranslucentBackground);
 	this->setWindowFlags(Qt::FramelessWindowHint);
+
+    platInf = a->platformNativeInterface();
+    status.drm_fd = (int) platInf->nativeResourceForIntegration("drm_fd");
+    status.drm_plane_set_req_handler = (drm_plane_set_req)platInf->nativeResourceForIntegration("drm_plane_set_req");
 
 	loopback = new MyThread();
 
@@ -129,13 +135,16 @@ void MainWindow::on_exit_clicked()
 	this->close();
 }
 
+
+
 void MyThread::run() {
 
-	while(status.exit == false) {
-		drm_resource.lock();
-		process_frame();
-		drm_resource.unlock();	
-		msleep(1);
+
+
+    while(status.exit == false) {
+        drm_resource.lock();
+        process_frame();
+        drm_resource.unlock();
 	}
 	end_streaming();
 	exit_devices();
